@@ -1,17 +1,23 @@
 """
 Bolkart.az partner data scraper
 Fetches all partners from the public API and saves to data/bolkart.csv
+
+API notes:
+  - Pagination is 1-indexed (page=0 always returns empty data)
+  - requests library is blocked by WAF; urllib is used instead
+  - sort param: populyarlıq (URL-encoded: populyarl%C4%B1q)
 """
 
 import csv
+import json
 import math
 import time
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
-import requests
-
 BASE_URL = "https://bolkart.az/api/bolkart-service/public/partners"
-PAGE_SIZE = 50
+PAGE_SIZE = 100  # max observed working size
 OUTPUT_PATH = Path(__file__).parent.parent / "data" / "bolkart.csv"
 
 HEADERS = {
@@ -22,9 +28,6 @@ HEADERS = {
         "Chrome/144.0.0.0 Safari/537.36"
     ),
     "dnt": "1",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-dest": "empty",
 }
 
 CSV_FIELDS = [
@@ -61,7 +64,7 @@ CSV_FIELDS = [
 
 
 def _multilang(obj, field="name"):
-    """Extract az/en/ru values from a multilingual field object."""
+    """Return (az, en, ru) from a multilingual field object."""
     val = (obj or {}).get(field) or {}
     return val.get("az"), val.get("en"), val.get("ru")
 
@@ -120,64 +123,60 @@ def flatten_partner(p: dict) -> dict:
     }
 
 
-def fetch_page(session: requests.Session, page: int, size: int = PAGE_SIZE) -> dict:
-    """Fetch a single page from the partners API."""
-    params = {
+def fetch_page(page: int, size: int = PAGE_SIZE) -> dict:
+    """Fetch a single page from the partners API using urllib (requests is WAF-blocked)."""
+    params = urllib.parse.urlencode({
         "page": page,
         "size": size,
         "popularity": "true",
-        "sort": "populyarl\u0131q",  # populyarlıq
-    }
+        "sort": "populyarl\u0131q",  # ı = U+0131
+    })
+    url = f"{BASE_URL}?{params}"
     referer = (
         f"https://bolkart.az/az/partnyorlar"
         f"?page={page}&size={size}&popularity=true&sort=populyarl%C4%B1q"
     )
-    headers = {**HEADERS, "referer": referer}
-    resp = session.get(BASE_URL, params=params, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+    req = urllib.request.Request(url, headers={**HEADERS, "referer": referer})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode())
 
 
 def main():
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    session = requests.Session()
-
-    print("Fetching page 0 to determine total count...")
-    first = fetch_page(session, page=0)
+    # API is 1-indexed — page=0 always returns empty data
+    print("Fetching page 1 to determine total count...")
+    first = fetch_page(page=1)
     total = first.get("totalElements", 0)
     total_pages = math.ceil(total / PAGE_SIZE)
     print(f"Total partners: {total} | Page size: {PAGE_SIZE} | Pages: {total_pages}")
 
     all_rows = []
 
-    # Process page 0
     for p in first.get("data", []):
         all_rows.append(flatten_partner(p))
-    print(f"  Page 0: {len(first.get('data', []))} partners")
+    print(f"  Page 1: {len(first.get('data', []))} partners")
 
-    # Fetch remaining pages
-    for page in range(1, total_pages):
-        try:
-            result = fetch_page(session, page=page)
-            items = result.get("data", [])
-            for p in items:
-                all_rows.append(flatten_partner(p))
-            print(f"  Page {page}: {len(items)} partners (running total: {len(all_rows)})")
-            time.sleep(0.4)
-        except requests.RequestException as exc:
-            print(f"  ERROR on page {page}: {exc} — retrying after 3s...")
-            time.sleep(3)
+    for page in range(2, total_pages + 1):
+        for attempt in range(2):
             try:
-                result = fetch_page(session, page=page)
+                result = fetch_page(page=page)
                 items = result.get("data", [])
                 for p in items:
                     all_rows.append(flatten_partner(p))
-                print(f"  Page {page} (retry): {len(items)} partners")
-            except Exception as exc2:
-                print(f"  SKIPPING page {page} after retry: {exc2}")
+                print(
+                    f"  Page {page}: {len(items)} partners "
+                    f"(running total: {len(all_rows)})"
+                )
+                time.sleep(0.4)
+                break
+            except Exception as exc:
+                if attempt == 0:
+                    print(f"  Page {page} error: {exc} — retrying after 3s...")
+                    time.sleep(3)
+                else:
+                    print(f"  SKIPPING page {page}: {exc}")
 
-    # Write CSV
     with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
